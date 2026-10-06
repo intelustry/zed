@@ -20,6 +20,7 @@ use editor::{
 };
 use extension::ExtensionHostProxy;
 use fs::{FakeFs, Fs};
+use futures::FutureExt as _;
 use git::{
     Oid,
     repository::{CommitData, GitCommitTemplate, RepoPath, Worktree as GitWorktree},
@@ -596,6 +597,127 @@ async fn test_remote_project_search(cx: &mut TestAppContext, server_cx: &mut Tes
         cx.clone(),
     )
     .await;
+}
+
+#[gpui::test(iterations = 20, seed = 24)]
+async fn test_remote_project_search_after_canceling_buffer_transfer(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/code"), json!({"project": {"file.txt": "needle"}}))
+        .await;
+
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project"), true, cx)
+        })
+        .await
+        .expect("remote worktree should open");
+    cx.run_until_parked();
+
+    let query = SearchQuery::text(
+        "needle".to_string(),
+        false,
+        true,
+        false,
+        PathMatcher::default(),
+        PathMatcher::default(),
+        false,
+        None,
+    )
+    .expect("search query should be valid");
+    let search = project.update(cx, |project, cx| project.search(query, cx));
+    let buffer_store = headless.read_with(server_cx, |headless, _| headless.buffer_store.clone());
+    while !buffer_store.read_with(server_cx, |store, _| store.has_shared_buffers()) {
+        assert!(
+            cx.executor().tick(),
+            "search should start sharing its matching buffer"
+        );
+    }
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.buffer_store().read(cx).buffers().count(), 0);
+    });
+
+    drop(search);
+    let mut search = std::pin::pin!(do_search_and_assert(
+        &project,
+        "need",
+        PathMatcher::default(),
+        false,
+        &[path!("project/file.txt")],
+        cx.clone(),
+    ));
+    assert!(search.as_mut().now_or_never().is_none());
+    cx.run_until_parked();
+    let buffer = search
+        .now_or_never()
+        .expect("search should finish after canceling the previous buffer transfer")
+        .into_iter()
+        .next()
+        .expect("search should return the matching buffer");
+    buffer.read_with(cx, |buffer, _| assert_eq!(buffer.text(), "needle"));
+}
+
+#[gpui::test]
+async fn test_remote_buffer_transfer_owned_by_buffer_store(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    let buffer_store = headless.read_with(server_cx, |headless, _| headless.buffer_store.clone());
+    let client_buffer_store = project.read_with(cx, |project, _| project.buffer_store().clone());
+    let mut remote_buffers = Vec::new();
+
+    for (forget_peer, forget_all) in [(false, false), (true, false), (false, true)] {
+        let buffer = buffer_store.update(server_cx, |store, cx| {
+            store.create_local_buffer("needle", None, false, cx)
+        });
+        let buffer_id = buffer.read_with(server_cx, |buffer, _| buffer.remote_id());
+        buffer.update(server_cx, |buffer, cx| {
+            for _ in 0..6 {
+                let end = buffer.len();
+                buffer.edit([(end..end, "!")], None, cx);
+            }
+        });
+        let remote_buffer =
+            client_buffer_store.update(cx, |store, cx| store.wait_for_remote_buffer(buffer_id, cx));
+        let (transfer, duplicate) = buffer_store.update(server_cx, |store, cx| {
+            (
+                store.create_buffer_for_peer(&buffer, proto::REMOTE_SERVER_PEER_ID, cx),
+                store.create_buffer_for_peer(&buffer, proto::REMOTE_SERVER_PEER_ID, cx),
+            )
+        });
+        duplicate
+            .now_or_never()
+            .expect("a duplicate caller should return immediately")
+            .expect("an already shared buffer should succeed");
+        drop(transfer);
+        server_cx.update(|_| drop(buffer));
+        if forget_peer {
+            buffer_store.update(server_cx, |store, _| {
+                store.forget_shared_buffers_for(&proto::REMOTE_SERVER_PEER_ID);
+            });
+        } else if forget_all {
+            buffer_store.update(server_cx, |store, _| store.forget_shared_buffers());
+        }
+        cx.run_until_parked();
+
+        let remote_buffer = remote_buffer
+            .now_or_never()
+            .expect("the transfer should survive caller drop and sharing metadata resets")
+            .expect("the transferred buffer should load");
+        remote_buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.remote_id(), buffer_id);
+            assert_eq!(buffer.text(), "needle!!!!!!");
+        });
+        remote_buffers.push(remote_buffer);
+    }
+    cx.update(|_| drop(project));
+    cx.update(|_| drop(remote_buffers));
+    cx.run_until_parked();
 }
 
 #[gpui::test]
